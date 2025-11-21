@@ -6,14 +6,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# System deps
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     curl \
     git \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# If you still need PLATFORM_COMMON_TOKEN for private git installs, keep the ARG and ENV lines
+# If you still need PLATFORM_COMMON_TOKEN for private git installs, keep this
 ARG PLATFORM_COMMON_TOKEN
 ENV PLATFORM_COMMON_TOKEN=${PLATFORM_COMMON_TOKEN}
 
@@ -22,11 +24,9 @@ COPY requirements.txt .
 
 # Install dependencies from requirements.txt
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
-
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 5008
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5008"]
