@@ -1,9 +1,11 @@
 # app/pubsub_worker.py
 from __future__ import annotations
 
+import base64
+import json
 import os
 import threading
-from typing import Mapping
+from typing import Mapping, Tuple, Optional
 
 from platform_common.gcp.pubsub import (
     PubSubSubscriberConfig,
@@ -17,54 +19,114 @@ _subscriber_thread: threading.Thread | None = None
 _subscriber: "VideoProcessingSubscriber" | None = None
 
 
+def _parse_object_key_metadata(
+    object_key: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Parse datastore_id and upload_session_id from an object key like:
+
+        raw/datastore/{datastore_id}/session/{upload_session_id}/{filename}
+
+    Returns (datastore_id, upload_session_id, filename).
+    """
+    if not object_key:
+        return None, None, None
+
+    parts = object_key.strip("/").split("/")
+
+    datastore_id: Optional[str] = None
+    upload_session_id: Optional[str] = None
+    filename: Optional[str] = parts[-1] if parts else None
+
+    for i, part in enumerate(parts):
+        if part == "datastore" and i + 1 < len(parts):
+            datastore_id = parts[i + 1]
+        elif part == "session" and i + 1 < len(parts):
+            upload_session_id = parts[i + 1]
+
+    return datastore_id, upload_session_id, filename
+
+
 class VideoProcessingSubscriber(BasePubSubSubscriber):
     """
     Subscriber for video processing jobs.
 
-    Expects Pub/Sub messages whose JSON payload includes at least:
-      - bucket: GCS bucket name
-      - name: object name/path in that bucket
+    BasePubSubSubscriber will already:
+      - pull messages
+      - base64-decode data
+      - json.loads into `payload`
 
-    We'll later extend this schema (datastore_id, file_id, job_type, etc.)
+    So here we just accept `payload` as a dict.
     """
 
-    def handle_message(self, payload: dict, attributes: Mapping[str, str]) -> None:
-        bucket = payload.get("bucket")
-        name = payload.get("name") or payload.get(
-            "object"
-        )  # cope with GCS-style events
-        content_type = payload.get("contentType") or attributes.get("content_type")
-
-        if not bucket or not name:
-            logger.error(
-                "Received video job without bucket/name",
-                payload=payload,
-                attributes=dict(attributes),
+    def handle_message(
+        self,
+        payload: dict,
+        attributes: Mapping[str, str] | None = None,
+    ) -> bool:
+        try:
+            logger.info(
+                "Received Pub/Sub payload=%r attributes=%r",
+                payload,
+                attributes or {},
             )
-            # Raise to force nack/retry
-            raise ValueError("Missing bucket or name in video job payload")
 
-        logger.info(
-            "Received video processing job",
-            bucket=bucket,
-            name=name,
-            content_type=content_type,
-            attributes=dict(attributes),
-        )
+            bucket = (
+                payload.get("bucket")
+                or payload.get("source_bucket")
+                or payload.get("file", {}).get("bucket")
+            )
 
-        # 🔜 TODO: wire this to ffprobe pipeline
-        # e.g.
-        # from app.video.ffprobe_runner import run_ffprobe_for_gcs_object
-        #
-        # metadata = run_ffprobe_for_gcs_object(bucket=bucket, object_name=name)
-        # persist / publish metadata somewhere (DB, Pub/Sub, Redis, etc.)
+            # accept multiple field names, including "object_key"
+            object_key = (
+                payload.get("name")
+                or payload.get("object_name")
+                or payload.get("object_key")
+                or payload.get("file", {}).get("name")
+            )
 
-        # For now, just log and return — BasePubSubSubscriber will ack on success.
-        logger.debug(
-            "Finished handling video processing job (no-op stub for now)",
-            bucket=bucket,
-            name=name,
-        )
+            if not bucket or not object_key:
+                logger.error(
+                    "Received video job without bucket/name attributes=%r payload=%r",
+                    attributes or {},
+                    payload,
+                )
+                # ACK so we don't loop this broken message
+                return True
+
+            # Parse IDs from the object_key path, if possible
+            parsed_datastore_id, parsed_upload_session_id, filename = (
+                _parse_object_key_metadata(object_key)
+            )
+
+            datastore_id = payload.get("datastore_id") or parsed_datastore_id
+            upload_session_id = (
+                payload.get("upload_session_id") or parsed_upload_session_id
+            )
+            file_id = payload.get("file_id")
+            media_type = payload.get("media_type")
+            task_type = payload.get("task_type")
+
+            logger.info(
+                "Handling video job: "
+                "bucket=%s object_key=%s datastore_id=%s upload_session_id=%s "
+                "file_id=%s media_type=%s task_type=%s",
+                bucket,
+                object_key,
+                datastore_id,
+                upload_session_id,
+                file_id,
+                media_type,
+                task_type,
+            )
+
+            # TODO: hand off to your actual processing pipeline here
+
+            return True
+        except Exception:
+            logger.exception("Unhandled error in video job handler")
+            # NACK so transient bugs can be retried, but avoid crashing the worker
+            return False
 
 
 def start_subscriber() -> None:
