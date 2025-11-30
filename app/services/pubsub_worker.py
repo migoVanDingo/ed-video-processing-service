@@ -5,7 +5,13 @@ import base64
 import json
 import os
 import threading
-from typing import Mapping, Tuple, Optional
+import asyncio
+from datetime import datetime, timezone
+from typing import Mapping, Tuple, Optional, Callable, Any, Dict
+
+from app.types.video_task_context import VideoTaskContext
+from app.task.handler.video_transcode import handle_video_transcode_preview
+from app.task.handler.video_inspect import handle_video_inspect
 
 from platform_common.gcp.pubsub import (
     PubSubSubscriberConfig,
@@ -13,10 +19,69 @@ from platform_common.gcp.pubsub import (
 )
 from platform_common.logging.logging import get_logger
 
+# DB bits – adjust paths if yours differ
+from platform_common.db.session import get_session
+from platform_common.models.file import File
+
+# IMPORTANT: import handlers so their module-level decorators run
+import app.task.handler.video_inspect  # noqa: F401
+import app.task.handler.video_transcode  # noqa: F401
+
 logger = get_logger("video.pubsub")
 
 _subscriber_thread: threading.Thread | None = None
 _subscriber: "VideoProcessingSubscriber" | None = None
+
+VideoTaskHandler = Callable[[VideoTaskContext], bool]
+TASK_HANDLERS: dict[str, VideoTaskHandler] = {
+    "video-transcode-preview": handle_video_transcode_preview,
+    "video-inspect": handle_video_inspect,
+}
+
+
+async def _mark_file_failed_async(
+    ctx: VideoTaskContext,
+    reason: str | None = None,
+) -> None:
+    """
+    Persist a failure on the File record: status='failed' and a failure meta block.
+    """
+    async for session in get_session():
+        if not ctx.file_id:
+            logger.warning("Cannot mark file failed: missing file_id in ctx=%r", ctx)
+            return
+
+        file: File | None = await session.get(File, ctx.file_id)
+        if not file:
+            logger.warning(
+                "Cannot mark file failed: File not found for file_id=%s",
+                ctx.file_id,
+            )
+            return
+
+        file.status = "failed"
+        file.meta = file.meta or {}
+
+        failure_meta: Dict[str, Any] = file.meta.get("failure") or {}
+        if reason:
+            failure_meta["reason"] = reason
+        failure_meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        file.meta["failure"] = failure_meta
+
+        session.add(file)
+        await session.commit()
+        return  # only use first yielded session
+
+
+def _mark_file_failed(ctx: VideoTaskContext, reason: str | None = None) -> None:
+    """
+    Sync wrapper for _mark_file_failed_async, safe to call from handle_message.
+    """
+    try:
+        asyncio.run(_mark_file_failed_async(ctx, reason))
+    except Exception:
+        logger.exception("Failed to persist file failure for file_id=%s", ctx.file_id)
 
 
 def _parse_object_key_metadata(
@@ -77,7 +142,6 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
                 or payload.get("file", {}).get("bucket")
             )
 
-            # accept multiple field names, including "object_key"
             object_key = (
                 payload.get("name")
                 or payload.get("object_name")
@@ -94,7 +158,6 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
                 # ACK so we don't loop this broken message
                 return True
 
-            # Parse IDs from the object_key path, if possible
             parsed_datastore_id, parsed_upload_session_id, filename = (
                 _parse_object_key_metadata(object_key)
             )
@@ -120,12 +183,63 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
                 task_type,
             )
 
-            # TODO: hand off to your actual processing pipeline here
+            ctx = VideoTaskContext(
+                bucket=bucket,
+                object_key=object_key,
+                datastore_id=datastore_id,
+                upload_session_id=upload_session_id,
+                file_id=file_id,
+                media_type=media_type,
+                task_type=task_type,
+                raw_payload=payload,
+                attributes=attributes,
+            )
 
+            if not task_type:
+                logger.warning(
+                    "Video job missing task_type; ignoring. ctx=%r",
+                    ctx,
+                )
+                return True  # nothing more to do
+
+            handler = TASK_HANDLERS.get(task_type)
+            if not handler:
+                # No handler registered (e.g. optional tasks not implemented yet)
+                # Just ACK; do not mark the file as failed.
+                return True
+
+            try:
+                ok = handler(ctx)
+            except Exception as e:
+                # Handler blew up: mark file failed and NACK for retry.
+                logger.exception(
+                    "Unhandled error in handler for task_type=%s file_id=%s",
+                    task_type,
+                    file_id,
+                )
+                _mark_file_failed(
+                    ctx,
+                    reason=f"{type(e).__name__}: {e}",
+                )
+                return False  # NACK -> Pub/Sub may retry
+
+            if not ok:
+                # Handler explicitly signalled failure
+                logger.error(
+                    "Handler for task_type=%s returned False; marking file failed. ctx=%r",
+                    task_type,
+                    ctx,
+                )
+                _mark_file_failed(ctx, reason="handler returned False")
+                return False  # NACK -> allow retry if desired
+
+            # Success
             return True
+
         except Exception:
             logger.exception("Unhandled error in video job handler")
-            # NACK so transient bugs can be retried, but avoid crashing the worker
+            # We *don't* know which part failed safely enough to mark the file,
+            # so just NACK and let retries / DLQ handle it.
             return False
 
 
