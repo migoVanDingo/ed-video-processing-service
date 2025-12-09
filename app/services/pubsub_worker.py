@@ -12,6 +12,9 @@ from typing import Mapping, Tuple, Optional, Callable, Any, Dict
 from app.types.video_task_context import VideoTaskContext
 from app.task.handler.video_transcode import handle_video_transcode_preview
 from app.task.handler.video_inspect import handle_video_inspect
+from typing import Any, Dict
+from sqlalchemy import select, func
+from platform_common.models.upload_session import UploadSession  # assuming this exists
 
 from platform_common.gcp.pubsub import (
     PubSubSubscriberConfig,
@@ -37,6 +40,139 @@ TASK_HANDLERS: dict[str, VideoTaskHandler] = {
     "video-transcode-preview": handle_video_transcode_preview,
     "video-inspect": handle_video_inspect,
 }
+
+REQUIRED_VIDEO_TASKS = ["video-inspect", "video-transcode-preview"]
+
+
+async def _maybe_update_upload_session_status_async(
+    session,
+    upload_session_id: str,
+) -> None:
+    """
+    Check all files in this upload session and update the session's status.
+
+    Simple rule:
+      - If any file.status == 'failed' -> session.status = 'failed'
+      - Else if all files.status == 'ready' and there is at least one file
+        -> session.status = 'ready'
+      - Else -> session.status = 'processing'
+    """
+    # Load all file statuses for this session
+    result = await session.execute(
+        select(File.status).where(File.upload_session_id == upload_session_id)
+    )
+    statuses = [row[0] for row in result.all()]
+
+    if not statuses:
+        # No files yet – you can choose to leave it as-is (e.g. 'pending_upload')
+        return
+
+    if any(s == "failed" for s in statuses):
+        new_status = "failed"
+    elif all(s == "ready" for s in statuses):
+        new_status = "ready"
+    else:
+        new_status = "processing"
+
+    # Fetch the UploadSession row
+    upload_session: UploadSession | None = await session.get(
+        UploadSession, upload_session_id
+    )
+    if not upload_session:
+        logger.warning(
+            "UploadSession not found for id=%s when updating status",
+            upload_session_id,
+        )
+        return
+
+    if upload_session.status == new_status:
+        return  # nothing to do
+
+    upload_session.status = new_status
+    session.add(upload_session)
+    await session.commit()
+
+    logger.info(
+        "UploadSession %s transitioned to status=%s",
+        upload_session_id,
+        new_status,
+    )
+
+    # ⬇️ Later, if you want to kick GraphQL subscriptions from DB:
+    # if new_status in ("ready", "failed"):
+    #     await publish_datastore_update(upload_session.datastore_id)
+
+
+def _mark_file_task_success(ctx: VideoTaskContext) -> None:
+    try:
+        asyncio.run(_mark_file_task_success_async(ctx))
+    except Exception:
+        logger.exception(
+            "Failed to persist file task success for file_id=%s",
+            ctx.file_id,
+        )
+
+
+async def _mark_file_task_success_async(ctx: VideoTaskContext) -> None:
+    """
+    Mark a specific task for this file as succeeded.
+    If all required tasks are done, mark file.status='ready' and
+    maybe update the upload_session status.
+    """
+    async for session in get_session():
+        if not ctx.file_id:
+            logger.warning(
+                "Cannot mark file task success: missing file_id in ctx=%r",
+                ctx,
+            )
+            return
+
+        file: File | None = await session.get(File, ctx.file_id)
+        if not file:
+            logger.warning(
+                "Cannot mark file task success: File not found for file_id=%s",
+                ctx.file_id,
+            )
+            return
+
+        # 1) Update task status in meta
+        file.meta = file.meta or {}
+        tasks: Dict[str, Any] = file.meta.get("tasks") or {}
+
+        task_type = ctx.task_type
+        if not task_type:
+            logger.warning(
+                "Cannot mark task success without task_type; ctx=%r",
+                ctx,
+            )
+            return
+
+        tasks[task_type] = {
+            "status": "ready",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        file.meta["tasks"] = tasks
+
+        # 2) If all required tasks are ready, mark file.status='ready'
+        all_ready = all(
+            tasks.get(t, {}).get("status") == "ready" for t in REQUIRED_VIDEO_TASKS
+        )
+
+        if all_ready:
+            file.status = "ready"
+
+        session.add(file)
+        await session.commit()
+
+        # 3) If file has an upload_session, maybe update its status
+        upload_session_id = file.upload_session_id or ctx.upload_session_id
+        if upload_session_id:
+            await _maybe_update_upload_session_status_async(
+                session,
+                upload_session_id,
+            )
+
+        return  # use only first yielded session
 
 
 async def _mark_file_failed_async(
@@ -71,6 +207,14 @@ async def _mark_file_failed_async(
 
         session.add(file)
         await session.commit()
+
+        upload_session_id = file.upload_session_id or ctx.upload_session_id
+        if upload_session_id:
+            await _maybe_update_upload_session_status_async(
+                session,
+                upload_session_id,
+            )
+
         return  # only use first yielded session
 
 
@@ -224,14 +368,16 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
                 return False  # NACK -> Pub/Sub may retry
 
             if not ok:
-                # Handler explicitly signalled failure
                 logger.error(
                     "Handler for task_type=%s returned False; marking file failed. ctx=%r",
                     task_type,
                     ctx,
                 )
                 _mark_file_failed(ctx, reason="handler returned False")
-                return False  # NACK -> allow retry if desired
+                return False  # NACK
+
+            # Success: mark this task as done and maybe update session
+            _mark_file_task_success(ctx)
 
             # Success
             return True
