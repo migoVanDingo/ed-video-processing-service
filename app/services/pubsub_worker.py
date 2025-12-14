@@ -57,14 +57,14 @@ async def _maybe_update_upload_session_status_async(
         -> session.status = 'ready'
       - Else -> session.status = 'processing'
     """
-    # Load all file statuses for this session
+    # 1) Get all file statuses for this session
     result = await session.execute(
         select(File.status).where(File.upload_session_id == upload_session_id)
     )
-    statuses = [row[0] for row in result.all()]
+    statuses = list(result.scalars().all())
 
     if not statuses:
-        # No files yet – you can choose to leave it as-is (e.g. 'pending_upload')
+        # No files yet; leave session.status as-is
         return
 
     if any(s == "failed" for s in statuses):
@@ -74,9 +74,10 @@ async def _maybe_update_upload_session_status_async(
     else:
         new_status = "processing"
 
-    # Fetch the UploadSession row
+    # 2) Load the UploadSession row
     upload_session: UploadSession | None = await session.get(
-        UploadSession, upload_session_id
+        UploadSession,
+        upload_session_id,
     )
     if not upload_session:
         logger.warning(
@@ -86,7 +87,7 @@ async def _maybe_update_upload_session_status_async(
         return
 
     if upload_session.status == new_status:
-        return  # nothing to do
+        return  # nothing changed
 
     upload_session.status = new_status
     session.add(upload_session)
@@ -98,9 +99,12 @@ async def _maybe_update_upload_session_status_async(
         new_status,
     )
 
-    # ⬇️ Later, if you want to kick GraphQL subscriptions from DB:
-    # if new_status in ("ready", "failed"):
-    #     await publish_datastore_update(upload_session.datastore_id)
+    # 🔹 NEW: trigger dashboard updates when session is done
+    if new_status in ("ready", "failed"):
+        # import inside function to avoid circular imports
+        from app.graphql.dashboard.subscription import publish_datastore_update
+
+        await publish_datastore_update(upload_session.datastore_id)
 
 
 def _mark_file_task_success(ctx: VideoTaskContext) -> None:
@@ -256,6 +260,65 @@ def _parse_object_key_metadata(
     return datastore_id, upload_session_id, filename
 
 
+async def _maybe_mark_file_processing_async(ctx: VideoTaskContext) -> None:
+    """
+    If the file exists and is still in a pre-terminal state,
+    mark file.status='processing' and maybe update the upload_session status.
+    """
+    async for session in get_session():
+        if not ctx.file_id:
+            logger.warning(
+                "Cannot mark file processing: missing file_id in ctx=%r",
+                ctx,
+            )
+            return
+
+        file: File | None = await session.get(File, ctx.file_id)
+        if not file:
+            logger.warning(
+                "Cannot mark file processing: File not found for file_id=%s",
+                ctx.file_id,
+            )
+            return
+
+        # Don't downgrade terminal states
+        if file.status in ("ready", "failed"):
+            return
+
+        if file.status != "processing":
+            file.status = "processing"
+            session.add(file)
+            await session.commit()
+
+            logger.info(
+                "File %s transitioned to status=processing",
+                ctx.file_id,
+            )
+
+            # Keep upload_session in sync
+            upload_session_id = file.upload_session_id or ctx.upload_session_id
+            if upload_session_id:
+                await _maybe_update_upload_session_status_async(
+                    session,
+                    upload_session_id,
+                )
+
+        return  # only use first yielded session
+
+
+def _maybe_mark_file_processing(ctx: VideoTaskContext) -> None:
+    """
+    Sync wrapper for _maybe_mark_file_processing_async, safe to call from handle_message.
+    """
+    try:
+        asyncio.run(_maybe_mark_file_processing_async(ctx))
+    except Exception:
+        logger.exception(
+            "Failed to mark file processing for file_id=%s",
+            ctx.file_id,
+        )
+
+
 class VideoProcessingSubscriber(BasePubSubSubscriber):
     """
     Subscriber for video processing jobs.
@@ -349,8 +412,11 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
             handler = TASK_HANDLERS.get(task_type)
             if not handler:
                 # No handler registered (e.g. optional tasks not implemented yet)
-                # Just ACK; do not mark the file as failed.
+                # Just ACK; do not mark the file as failed or processing.
                 return True
+
+            # 🔹 NEW: mark file as processing now that we have real work to do
+            _maybe_mark_file_processing(ctx)
 
             try:
                 ok = handler(ctx)
