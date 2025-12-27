@@ -1,32 +1,26 @@
 # app/pubsub_worker.py
 from __future__ import annotations
 
-import base64
-import json
 import os
 import threading
 import asyncio
 from datetime import datetime, timezone
-from typing import Mapping, Tuple, Optional, Callable, Any, Dict
+from typing import Mapping, Optional, Callable, Any, Dict, Tuple
+
+from sqlalchemy import select
 
 from app.types.video_task_context import VideoTaskContext
 from app.task.handler.video_transcode import handle_video_transcode_preview
 from app.task.handler.video_inspect import handle_video_inspect
-from typing import Any, Dict
-from sqlalchemy import select, func
-from platform_common.models.upload_session import UploadSession  # assuming this exists
 
-from platform_common.gcp.pubsub import (
-    PubSubSubscriberConfig,
-    BasePubSubSubscriber,
-)
+from platform_common.models.upload_session import UploadSession
+from platform_common.gcp.pubsub import PubSubSubscriberConfig, BasePubSubSubscriber
 from platform_common.logging.logging import get_logger
 
-# DB bits – adjust paths if yours differ
 from platform_common.db.session import get_session
 from platform_common.models.file import File
 
-# IMPORTANT: import handlers so their module-level decorators run
+# IMPORTANT: import handlers so their module-level decorators run (if you use decorators elsewhere)
 import app.task.handler.video_inspect  # noqa: F401
 import app.task.handler.video_transcode  # noqa: F401
 
@@ -44,27 +38,36 @@ TASK_HANDLERS: dict[str, VideoTaskHandler] = {
 REQUIRED_VIDEO_TASKS = ["video-inspect", "video-transcode-preview"]
 
 
+# ──────────────────────────────────────────────────────────────
+# Helpers to make JSON/meta updates reliably persist
+# (avoids in-place mutation issues with JSON/JSONB columns)
+# ──────────────────────────────────────────────────────────────
+def _meta_copy(file: File) -> Dict[str, Any]:
+    return dict(file.meta or {})
+
+
+def _nested_copy(meta: Dict[str, Any], key: str) -> Dict[str, Any]:
+    val = meta.get(key) or {}
+    return dict(val) if isinstance(val, dict) else {}
+
+
 async def _maybe_update_upload_session_status_async(
-    session,
-    upload_session_id: str,
+    session, upload_session_id: str
 ) -> None:
     """
     Check all files in this upload session and update the session's status.
 
     Simple rule:
       - If any file.status == 'failed' -> session.status = 'failed'
-      - Else if all files.status == 'ready' and there is at least one file
-        -> session.status = 'ready'
+      - Else if all files.status == 'ready' and there is at least one file -> session.status = 'ready'
       - Else -> session.status = 'processing'
     """
-    # 1) Get all file statuses for this session
     result = await session.execute(
         select(File.status).where(File.upload_session_id == upload_session_id)
     )
     statuses = list(result.scalars().all())
 
     if not statuses:
-        # No files yet; leave session.status as-is
         return
 
     if any(s == "failed" for s in statuses):
@@ -74,37 +77,25 @@ async def _maybe_update_upload_session_status_async(
     else:
         new_status = "processing"
 
-    # 2) Load the UploadSession row
     upload_session: UploadSession | None = await session.get(
-        UploadSession,
-        upload_session_id,
+        UploadSession, upload_session_id
     )
     if not upload_session:
         logger.warning(
-            "UploadSession not found for id=%s when updating status",
-            upload_session_id,
+            "UploadSession not found for id=%s when updating status", upload_session_id
         )
         return
 
     if upload_session.status == new_status:
-        return  # nothing changed
+        return
 
     upload_session.status = new_status
     session.add(upload_session)
     await session.commit()
 
     logger.info(
-        "UploadSession %s transitioned to status=%s",
-        upload_session_id,
-        new_status,
+        "UploadSession %s transitioned to status=%s", upload_session_id, new_status
     )
-
-    # 🔹 NEW: trigger dashboard updates when session is done
-    if new_status in ("ready", "failed"):
-        # import inside function to avoid circular imports
-        from app.graphql.dashboard.subscription import publish_datastore_update
-
-        await publish_datastore_update(upload_session.datastore_id)
 
 
 def _mark_file_task_success(ctx: VideoTaskContext) -> None:
@@ -112,22 +103,19 @@ def _mark_file_task_success(ctx: VideoTaskContext) -> None:
         asyncio.run(_mark_file_task_success_async(ctx))
     except Exception:
         logger.exception(
-            "Failed to persist file task success for file_id=%s",
-            ctx.file_id,
+            "Failed to persist file task success for file_id=%s", ctx.file_id
         )
 
 
 async def _mark_file_task_success_async(ctx: VideoTaskContext) -> None:
     """
     Mark a specific task for this file as succeeded.
-    If all required tasks are done, mark file.status='ready' and
-    maybe update the upload_session status.
+    If all required tasks are done, mark file.status='ready' and maybe update the upload_session status.
     """
     async for session in get_session():
         if not ctx.file_id:
             logger.warning(
-                "Cannot mark file task success: missing file_id in ctx=%r",
-                ctx,
+                "Cannot mark file task success: missing file_id in ctx=%r", ctx
             )
             return
 
@@ -139,49 +127,43 @@ async def _mark_file_task_success_async(ctx: VideoTaskContext) -> None:
             )
             return
 
-        # 1) Update task status in meta
-        file.meta = file.meta or {}
-        tasks: Dict[str, Any] = file.meta.get("tasks") or {}
-
         task_type = ctx.task_type
         if not task_type:
-            logger.warning(
-                "Cannot mark task success without task_type; ctx=%r",
-                ctx,
-            )
+            logger.warning("Cannot mark task success without task_type; ctx=%r", ctx)
             return
+
+        # ✅ Copy → modify → reassign to ensure JSON persistence
+        meta = _meta_copy(file)
+        tasks = dict((meta.get("tasks") or {}))
 
         tasks[task_type] = {
             "status": "ready",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        file.meta["tasks"] = tasks
+
+        meta["tasks"] = tasks
+        file.meta = meta  # <-- critical (top-level reassignment)
 
         # 2) If all required tasks are ready, mark file.status='ready'
         all_ready = all(
             tasks.get(t, {}).get("status") == "ready" for t in REQUIRED_VIDEO_TASKS
         )
-
         if all_ready:
             file.status = "ready"
 
         session.add(file)
         await session.commit()
 
-        # 3) If file has an upload_session, maybe update its status
+        # 3) Keep UploadSession in sync
         upload_session_id = file.upload_session_id or ctx.upload_session_id
         if upload_session_id:
-            await _maybe_update_upload_session_status_async(
-                session,
-                upload_session_id,
-            )
+            await _maybe_update_upload_session_status_async(session, upload_session_id)
 
-        return  # use only first yielded session
+        return
 
 
 async def _mark_file_failed_async(
-    ctx: VideoTaskContext,
-    reason: str | None = None,
+    ctx: VideoTaskContext, reason: str | None = None
 ) -> None:
     """
     Persist a failure on the File record: status='failed' and a failure meta block.
@@ -194,32 +176,29 @@ async def _mark_file_failed_async(
         file: File | None = await session.get(File, ctx.file_id)
         if not file:
             logger.warning(
-                "Cannot mark file failed: File not found for file_id=%s",
-                ctx.file_id,
+                "Cannot mark file failed: File not found for file_id=%s", ctx.file_id
             )
             return
 
         file.status = "failed"
-        file.meta = file.meta or {}
 
-        failure_meta: Dict[str, Any] = file.meta.get("failure") or {}
+        # ✅ Copy → modify → reassign
+        meta = _meta_copy(file)
+        failure_meta = dict(meta.get("failure") or {})
         if reason:
             failure_meta["reason"] = reason
         failure_meta["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-        file.meta["failure"] = failure_meta
+        meta["failure"] = failure_meta
+        file.meta = meta
 
         session.add(file)
         await session.commit()
 
         upload_session_id = file.upload_session_id or ctx.upload_session_id
         if upload_session_id:
-            await _maybe_update_upload_session_status_async(
-                session,
-                upload_session_id,
-            )
+            await _maybe_update_upload_session_status_async(session, upload_session_id)
 
-        return  # only use first yielded session
+        return
 
 
 def _mark_file_failed(ctx: VideoTaskContext, reason: str | None = None) -> None:
@@ -234,11 +213,11 @@ def _mark_file_failed(ctx: VideoTaskContext, reason: str | None = None) -> None:
 
 def _parse_object_key_metadata(
     object_key: str,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Parse datastore_id and upload_session_id from an object key like:
 
-        raw/datastore/{datastore_id}/session/{upload_session_id}/{filename}
+        raw/datastore/{datastore_id}/session/{upload_session_id}/file/{file_id}/{filename}
 
     Returns (datastore_id, upload_session_id, filename).
     """
@@ -262,14 +241,13 @@ def _parse_object_key_metadata(
 
 async def _maybe_mark_file_processing_async(ctx: VideoTaskContext) -> None:
     """
-    If the file exists and is still in a pre-terminal state,
-    mark file.status='processing' and maybe update the upload_session status.
+    If the file exists and is still in a pre-terminal state, mark file.status='processing'
+    and maybe update the upload_session status.
     """
     async for session in get_session():
         if not ctx.file_id:
             logger.warning(
-                "Cannot mark file processing: missing file_id in ctx=%r",
-                ctx,
+                "Cannot mark file processing: missing file_id in ctx=%r", ctx
             )
             return
 
@@ -290,20 +268,15 @@ async def _maybe_mark_file_processing_async(ctx: VideoTaskContext) -> None:
             session.add(file)
             await session.commit()
 
-            logger.info(
-                "File %s transitioned to status=processing",
-                ctx.file_id,
-            )
+            logger.info("File %s transitioned to status=processing", ctx.file_id)
 
-            # Keep upload_session in sync
             upload_session_id = file.upload_session_id or ctx.upload_session_id
             if upload_session_id:
                 await _maybe_update_upload_session_status_async(
-                    session,
-                    upload_session_id,
+                    session, upload_session_id
                 )
 
-        return  # only use first yielded session
+        return
 
 
 def _maybe_mark_file_processing(ctx: VideoTaskContext) -> None:
@@ -313,10 +286,7 @@ def _maybe_mark_file_processing(ctx: VideoTaskContext) -> None:
     try:
         asyncio.run(_maybe_mark_file_processing_async(ctx))
     except Exception:
-        logger.exception(
-            "Failed to mark file processing for file_id=%s",
-            ctx.file_id,
-        )
+        logger.exception("Failed to mark file processing for file_id=%s", ctx.file_id)
 
 
 class VideoProcessingSubscriber(BasePubSubSubscriber):
@@ -332,15 +302,11 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
     """
 
     def handle_message(
-        self,
-        payload: dict,
-        attributes: Mapping[str, str] | None = None,
+        self, payload: dict, attributes: Mapping[str, str] | None = None
     ) -> bool:
         try:
             logger.info(
-                "Received Pub/Sub payload=%r attributes=%r",
-                payload,
-                attributes or {},
+                "Received Pub/Sub payload=%r attributes=%r", payload, attributes or {}
             )
 
             bucket = (
@@ -362,10 +328,19 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
                     attributes or {},
                     payload,
                 )
-                # ACK so we don't loop this broken message
+                return True  # ACK broken message so it doesn't loop forever
+
+            task_type = payload.get("task_type")  # ✅ define early
+
+            # ✅ HARD SAFETY: only process raw uploads to prevent Eventarc loops
+            # (Curated outputs often trigger object.finalized again.)
+            if not object_key.startswith("raw/"):
+                logger.info(
+                    "Ignoring non-raw object: %s (task=%s)", object_key, task_type
+                )
                 return True
 
-            parsed_datastore_id, parsed_upload_session_id, filename = (
+            parsed_datastore_id, parsed_upload_session_id, _filename = (
                 _parse_object_key_metadata(object_key)
             )
 
@@ -375,11 +350,9 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
             )
             file_id = payload.get("file_id")
             media_type = payload.get("media_type")
-            task_type = payload.get("task_type")
 
             logger.info(
-                "Handling video job: "
-                "bucket=%s object_key=%s datastore_id=%s upload_session_id=%s "
+                "Handling video job: bucket=%s object_key=%s datastore_id=%s upload_session_id=%s "
                 "file_id=%s media_type=%s task_type=%s",
                 bucket,
                 object_key,
@@ -403,34 +376,26 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
             )
 
             if not task_type:
-                logger.warning(
-                    "Video job missing task_type; ignoring. ctx=%r",
-                    ctx,
-                )
-                return True  # nothing more to do
+                logger.warning("Video job missing task_type; ignoring. ctx=%r", ctx)
+                return True
 
             handler = TASK_HANDLERS.get(task_type)
             if not handler:
-                # No handler registered (e.g. optional tasks not implemented yet)
-                # Just ACK; do not mark the file as failed or processing.
+                # Optional tasks not implemented in this service; ACK and move on.
                 return True
 
-            # 🔹 NEW: mark file as processing now that we have real work to do
+            # Mark processing (only if we have a file_id)
             _maybe_mark_file_processing(ctx)
 
             try:
                 ok = handler(ctx)
             except Exception as e:
-                # Handler blew up: mark file failed and NACK for retry.
                 logger.exception(
                     "Unhandled error in handler for task_type=%s file_id=%s",
                     task_type,
                     file_id,
                 )
-                _mark_file_failed(
-                    ctx,
-                    reason=f"{type(e).__name__}: {e}",
-                )
+                _mark_file_failed(ctx, reason=f"{type(e).__name__}: {e}")
                 return False  # NACK -> Pub/Sub may retry
 
             if not ok:
@@ -444,15 +409,11 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
 
             # Success: mark this task as done and maybe update session
             _mark_file_task_success(ctx)
-
-            # Success
             return True
 
         except Exception:
             logger.exception("Unhandled error in video job handler")
-            # We *don't* know which part failed safely enough to mark the file,
-            # so just NACK and let retries / DLQ handle it.
-            return False
+            return False  # NACK
 
 
 def start_subscriber() -> None:
@@ -469,14 +430,12 @@ def start_subscriber() -> None:
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID") or os.getenv("GCP_PROJECT_ID")
     if not project_id:
         logger.error(
-            "Cannot start VideoProcessingSubscriber: "
-            "GOOGLE_CLOUD_PROJECT_ID or GCP_PROJECT_ID must be set"
+            "Cannot start VideoProcessingSubscriber: GOOGLE_CLOUD_PROJECT_ID or GCP_PROJECT_ID must be set"
         )
         return
 
     subscription_id = os.getenv(
-        "VIDEO_PROCESSING_SUBSCRIPTION_ID",
-        "video-processing-sub",  # default; adjust to your real sub name
+        "VIDEO_PROCESSING_SUBSCRIPTION_ID", "video-processing-sub"
     )
 
     config = PubSubSubscriberConfig(
@@ -495,9 +454,9 @@ def start_subscriber() -> None:
     _subscriber_thread.start()
 
     logger.info(
-        "Started VideoProcessingSubscriber thread",
-        project_id=project_id,
-        subscription_id=subscription_id,
+        "Started VideoProcessingSubscriber thread project_id=%s subscription_id=%s",
+        project_id,
+        subscription_id,
     )
 
 

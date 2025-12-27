@@ -1,5 +1,6 @@
 # app/video_inspect.py
 from __future__ import annotations
+
 import asyncio
 import json
 import subprocess
@@ -12,14 +13,10 @@ from platform_common.db.session import get_session
 from platform_common.models.file import File
 from platform_common.utils.time_helpers import get_current_epoch
 
-from app.services.pubsub_worker import (
-    VideoTaskContext,
-)  # adjust import
-
+from app.services.pubsub_worker import VideoTaskContext  # adjust import
 from app.task.registry.video_task_registry import video_task_handler
 
 logger = get_logger("video.inspect")
-
 storage_client = storage.Client()  # reuse across calls
 
 
@@ -69,11 +66,7 @@ def _extract_video_metadata(ffprobe_result: Dict[str, Any]) -> Dict[str, Any]:
     streams = ffprobe_result.get("streams", [])
     format_ = ffprobe_result.get("format", {})
 
-    video_stream = next(
-        (s for s in streams if s.get("codec_type") == "video"),
-        None,
-    )
-
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
     if not video_stream:
         raise ValueError("No video stream found in ffprobe output")
 
@@ -114,52 +107,66 @@ def _extract_video_metadata(ffprobe_result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _deep_merge_dict(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively merge patch into base, returning a NEW dict.
+    (No in-place mutation of the ORM-owned dict.)
+    """
+    out: Dict[str, Any] = dict(base)  # shallow copy
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out
+
+
 async def _save_video_inspect_metadata_async(
     ctx: VideoTaskContext,
     metadata: Dict[str, Any],
 ) -> None:
     """
-    Async bit: uses async get_session and async ORM operations.
+    Persist inspect metadata into File.meta using a merge + reassign pattern
+    so SQLAlchemy/JSON columns reliably detect changes.
     """
-    # get_session() is an async generator (FastAPI-style dependency),
-    # so we iterate it instead of using "async with".
     async for session in get_session():
         file = await session.get(File, ctx.file_id)
         if not file:
             logger.warning(
-                "File not found for file_id=%s; skipping DB update",
-                ctx.file_id,
+                "File not found for file_id=%s; skipping DB update", ctx.file_id
             )
             return
 
-        file.meta = file.meta or {}
-
-        # Raw location (ensure stored)
-        raw_meta = file.meta.get("raw") or {}
-        raw_meta.setdefault("bucket", ctx.bucket)
-        raw_meta.setdefault("object_key", ctx.object_key)
-        file.meta["raw"] = raw_meta
-
-        # Video inspect metadata
-        video_meta = file.meta.get("video") or {}
-        video_meta["inspect"] = {
-            **metadata,
-            "inspected_at": get_current_epoch(),
+        # Build patch (what we want to ensure exists/updated)
+        patch: Dict[str, Any] = {
+            "raw": {
+                "bucket": ctx.bucket,
+                "object_key": ctx.object_key,
+            },
+            "video": {
+                "inspect": {
+                    **metadata,
+                    "inspected_at": get_current_epoch(),
+                }
+            },
         }
-        file.meta["video"] = video_meta
+
+        current_meta: Dict[str, Any] = dict(file.meta or {})
+        new_meta = _deep_merge_dict(current_meta, patch)
+
+        # ✅ Reassign to mark JSON column dirty
+        file.meta = new_meta
 
         session.add(file)
         await session.commit()
-        return  # important: only use the first yielded session
+        return  # only first yielded session
 
 
 @video_task_handler("video-inspect")
 def handle_video_inspect(ctx: VideoTaskContext) -> bool:
     if ctx.media_type != "video":
         logger.warning(
-            "video-inspect received non-video media_type=%s ctx=%r",
-            ctx.media_type,
-            ctx,
+            "video-inspect received non-video media_type=%s ctx=%r", ctx.media_type, ctx
         )
         return True
 
@@ -167,28 +174,22 @@ def handle_video_inspect(ctx: VideoTaskContext) -> bool:
         logger.error("video-inspect missing file_id ctx=%r", ctx)
         return True
 
-    tmp_path = None
+    tmp_path: str | None = None
     try:
         tmp_path = _download_gcs_object_to_tempfile(ctx.bucket, ctx.object_key)
         ffprobe_result = _run_ffprobe(tmp_path)
         metadata = _extract_video_metadata(ffprobe_result)
 
         logger.info(
-            "video-inspect metadata file_id=%s metadata=%r",
-            ctx.file_id,
-            metadata,
+            "video-inspect metadata file_id=%s metadata=%r", ctx.file_id, metadata
         )
 
-        # <-- This is the important part: run the async DB helper from sync code.
         asyncio.run(_save_video_inspect_metadata_async(ctx, metadata))
-
         return True
 
     except Exception:
         logger.exception(
-            "Unexpected error in video-inspect for file_id=%s ctx=%r",
-            ctx.file_id,
-            ctx,
+            "Unexpected error in video-inspect for file_id=%s ctx=%r", ctx.file_id, ctx
         )
         return False
 

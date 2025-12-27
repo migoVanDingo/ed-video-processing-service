@@ -5,11 +5,11 @@ import asyncio
 import os
 import subprocess
 import tempfile
-from platform_common.utils.time_helpers import get_current_epoch
 from typing import Any, Dict
 
 from google.cloud import storage
 
+from platform_common.utils.time_helpers import get_current_epoch
 from platform_common.db.session import get_session
 from platform_common.models.file import File
 from platform_common.logging.logging import get_logger
@@ -49,17 +49,16 @@ def _run_ffmpeg_normalize(src_path: str, dst_path: str) -> None:
     """
     Run ffmpeg to normalize the video into a canonical preview/source format.
 
-    This is a simple example:
+    Example:
       - H.264 video
       - AAC audio
       - Max ~1080p while preserving aspect ratio
     """
     cmd = [
         "ffmpeg",
-        "-y",  # overwrite output
+        "-y",
         "-i",
         src_path,
-        # Example scaling filter: max 1920x1080, preserve aspect ratio
         "-vf",
         "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease",
         "-c:v",
@@ -75,11 +74,7 @@ def _run_ffmpeg_normalize(src_path: str, dst_path: str) -> None:
         dst_path,
     ]
     logger.info("Running ffmpeg: %s", " ".join(cmd))
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         logger.error(
             "ffmpeg failed (code %s): %s",
@@ -89,7 +84,17 @@ def _run_ffmpeg_normalize(src_path: str, dst_path: str) -> None:
         raise RuntimeError("ffmpeg normalization failed")
 
 
-# app/task/handler/video_transcode.py
+def _deep_merge_dict(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Recursively merge patch into base, returning a NEW dict.
+    """
+    out: Dict[str, Any] = dict(base)
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out
 
 
 async def _is_already_normalized(ctx: VideoTaskContext) -> bool:
@@ -101,7 +106,7 @@ async def _is_already_normalized(ctx: VideoTaskContext) -> bool:
         if not file or not file.meta:
             return False
 
-        video_meta: Dict[str, Any] = file.meta.get("video") or {}
+        video_meta: Dict[str, Any] = (file.meta or {}).get("video") or {}
         status = video_meta.get("status")
         if status == "normalized":
             logger.info(
@@ -110,9 +115,8 @@ async def _is_already_normalized(ctx: VideoTaskContext) -> bool:
             )
             return True
 
-        return False  # we only ever want the first yielded session
+        return False
 
-    # Fallback (shouldn’t normally be hit)
     return False
 
 
@@ -122,8 +126,8 @@ async def _update_file_after_transcode_async(
     profile: str = "source-1080p",
 ) -> None:
     """
-    Async helper: persist normalized location + status into File.meta
-    and promote File.bucket/object_key to curated.
+    Persist normalized location + status into File.meta and promote File.bucket/object_key
+    using merge + reassign so JSON changes always persist.
     """
     async for session in get_session():
         file: File | None = await session.get(File, ctx.file_id)
@@ -134,33 +138,38 @@ async def _update_file_after_transcode_async(
             )
             return
 
-        file.meta = file.meta or {}
-
-        # Ensure raw info is stored
-        raw_meta: Dict[str, Any] = file.meta.get("raw") or {}
-        raw_meta.setdefault("bucket", ctx.bucket)
-        raw_meta.setdefault("object_key", ctx.object_key)
-        file.meta["raw"] = raw_meta
-
-        # Video normalization metadata
-        video_meta: Dict[str, Any] = file.meta.get("video") or {}
-        video_meta["normalized"] = {
-            "bucket": ctx.bucket,
-            "object_key": curated_object_key,
-            "profile": profile,
-            "completed_at": get_current_epoch(),
+        patch: Dict[str, Any] = {
+            "raw": {
+                "bucket": ctx.bucket,
+                "object_key": ctx.object_key,
+            },
+            "video": {
+                "normalized": {
+                    "bucket": ctx.bucket,
+                    "object_key": curated_object_key,
+                    "profile": profile,
+                    "completed_at": get_current_epoch(),
+                },
+                "status": "normalized",
+            },
         }
-        video_meta["status"] = "normalized"
-        file.meta["video"] = video_meta
+
+        current_meta: Dict[str, Any] = dict(file.meta or {})
+        new_meta = _deep_merge_dict(current_meta, patch)
+
+        # ✅ Reassign to mark JSON dirty
+        file.meta = new_meta
+
+        # Mark file ready (you may want to keep "processing" until all required tasks finish)
         file.status = "ready"
 
-        # Promote the file to point at curated
+        # Promote file pointer to curated
         file.bucket = ctx.bucket
         file.object_key = curated_object_key
 
         session.add(file)
         await session.commit()
-        return  # only one session, so we’re done
+        return
 
 
 @video_task_handler("video-transcode-preview")
@@ -168,13 +177,11 @@ def handle_video_transcode_preview(ctx: VideoTaskContext) -> bool:
     """
     Normalize the raw video into a curated 'source' asset and promote the File.
 
-    Reads from:
+    Reads:
       gs://<bucket>/<raw object_key>
 
-    Writes to:
+    Writes:
       gs://<bucket>/curated/datastore/<datastore_id>/file/<file_id>/source/<file_id>-normalized.mp4
-
-    Updates File.meta["raw"], File.meta["video"]["normalized"], and File.bucket/object_key.
     """
     if ctx.media_type != "video":
         logger.warning(
@@ -196,35 +203,28 @@ def handle_video_transcode_preview(ctx: VideoTaskContext) -> bool:
     normalized_tmp: str | None = None
 
     try:
-        # Optional idempotence check: if already normalized, skip work.
+        # Optional idempotence check
         try:
             if asyncio.run(_is_already_normalized(ctx)):
                 return True
         except RuntimeError:
-            # If an event loop weirdness happens, log and continue without idempotence.
             logger.exception("Error checking normalization status; continuing anyway.")
 
-        # 1) Download raw file
         raw_tmp = _download_gcs_to_temp(ctx.bucket, ctx.object_key)
 
-        # 2) Allocate temp path for normalized file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp.close()
         normalized_tmp = tmp.name
 
-        # 3) Run ffmpeg normalization
         _run_ffmpeg_normalize(raw_tmp, normalized_tmp)
 
-        # 4) Compute curated object key
         curated_object_key = (
             f"curated/datastore/{ctx.datastore_id}/file/{ctx.file_id}/source/"
             f"{ctx.file_id}-normalized.mp4"
         )
 
-        # 5) Upload normalized video to curated path
         _upload_temp_to_gcs(normalized_tmp, ctx.bucket, curated_object_key)
 
-        # 6) Update File in DB (meta + bucket/object_key)
         asyncio.run(
             _update_file_after_transcode_async(
                 ctx,
@@ -246,11 +246,9 @@ def handle_video_transcode_preview(ctx: VideoTaskContext) -> bool:
             ctx.file_id,
             ctx,
         )
-        # Let the subscriber NACK so this can be retried on transient failures
         return False
 
     finally:
-        # Clean up temp files
         for path in (raw_tmp, normalized_tmp):
             if path:
                 try:
