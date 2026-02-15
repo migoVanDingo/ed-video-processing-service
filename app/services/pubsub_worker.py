@@ -5,7 +5,7 @@ import os
 import threading
 import asyncio
 from datetime import datetime, timezone
-from typing import Mapping, Optional, Callable, Any, Dict, Tuple
+from typing import Mapping, Optional, Callable, Any, Dict, Tuple, Coroutine
 
 from sqlalchemy import select
 
@@ -100,7 +100,7 @@ async def _maybe_update_upload_session_status_async(
 
 def _mark_file_task_success(ctx: VideoTaskContext) -> None:
     try:
-        asyncio.run(_mark_file_task_success_async(ctx))
+        run_async(_mark_file_task_success_async(ctx))
     except Exception:
         logger.exception(
             "Failed to persist file task success for file_id=%s", ctx.file_id
@@ -206,7 +206,7 @@ def _mark_file_failed(ctx: VideoTaskContext, reason: str | None = None) -> None:
     Sync wrapper for _mark_file_failed_async, safe to call from handle_message.
     """
     try:
-        asyncio.run(_mark_file_failed_async(ctx, reason))
+        run_async(_mark_file_failed_async(ctx, reason))
     except Exception:
         logger.exception("Failed to persist file failure for file_id=%s", ctx.file_id)
 
@@ -284,7 +284,7 @@ def _maybe_mark_file_processing(ctx: VideoTaskContext) -> None:
     Sync wrapper for _maybe_mark_file_processing_async, safe to call from handle_message.
     """
     try:
-        asyncio.run(_maybe_mark_file_processing_async(ctx))
+        run_async(_maybe_mark_file_processing_async(ctx))
     except Exception:
         logger.exception("Failed to mark file processing for file_id=%s", ctx.file_id)
 
@@ -300,6 +300,81 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
 
     So here we just accept `payload` as a dict.
     """
+    def __init__(self, config: PubSubSubscriberConfig):
+        super().__init__(config)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: threading.Thread | None = None
+        self._loop_ready = threading.Event()
+
+    def _loop_runner(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._loop_ready.set()
+
+        logger.info(
+            "Created persistent async loop for video worker loop_id=%s thread=%s",
+            id(loop),
+            threading.current_thread().name,
+        )
+
+        try:
+            loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            logger.info("Closed video worker async loop loop_id=%s", id(loop))
+
+    def _start_async_loop(self) -> None:
+        if self._loop_thread and self._loop_thread.is_alive():
+            return
+
+        self._loop_ready.clear()
+        self._loop_thread = threading.Thread(
+            target=self._loop_runner,
+            name="video-processing-async-loop",
+            daemon=True,
+        )
+        self._loop_thread.start()
+
+        if not self._loop_ready.wait(timeout=5):
+            raise RuntimeError("Timed out creating persistent async loop")
+
+    def _stop_async_loop(self) -> None:
+        loop = self._loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+
+        if self._loop_thread and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=5)
+
+        self._loop = None
+        self._loop_thread = None
+        self._loop_ready.clear()
+
+    def run_async(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            coro.close()
+            raise RuntimeError("Video worker async loop is not running")
+
+        logger.debug("run_async submitting coroutine loop_id=%s", id(loop))
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
+
+    def run_forever(self) -> None:
+        self._start_async_loop()
+        try:
+            super().run_forever()
+        finally:
+            self._stop_async_loop()
 
     def handle_message(
         self, payload: dict, attributes: Mapping[str, str] | None = None
@@ -414,6 +489,17 @@ class VideoProcessingSubscriber(BasePubSubSubscriber):
         except Exception:
             logger.exception("Unhandled error in video job handler")
             return False  # NACK
+
+
+def run_async(coro: Coroutine[Any, Any, Any]) -> Any:
+    """
+    Run a coroutine on the subscriber's persistent async loop and block for result.
+    """
+    subscriber = _subscriber
+    if subscriber is None:
+        coro.close()
+        raise RuntimeError("VideoProcessingSubscriber is not running")
+    return subscriber.run_async(coro)
 
 
 def start_subscriber() -> None:

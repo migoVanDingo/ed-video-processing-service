@@ -1,7 +1,6 @@
 # app/task/handler/video_transcode.py
 from __future__ import annotations
 
-import asyncio
 import os
 import subprocess
 import tempfile
@@ -19,6 +18,12 @@ from app.task.registry.video_task_registry import video_task_handler
 
 logger = get_logger("video.transcode")
 storage_client = storage.Client()
+
+
+def _run_async(coro: Any) -> Any:
+    from app.services.pubsub_worker import run_async
+
+    return run_async(coro)
 
 
 def _download_gcs_to_temp(bucket: str, object_key: str, suffix: str = ".mp4") -> str:
@@ -205,7 +210,7 @@ def handle_video_transcode_preview(ctx: VideoTaskContext) -> bool:
     try:
         # Optional idempotence check
         try:
-            if asyncio.run(_is_already_normalized(ctx)):
+            if _run_async(_is_already_normalized(ctx)):
                 return True
         except RuntimeError:
             logger.exception("Error checking normalization status; continuing anyway.")
@@ -225,7 +230,7 @@ def handle_video_transcode_preview(ctx: VideoTaskContext) -> bool:
 
         _upload_temp_to_gcs(normalized_tmp, ctx.bucket, curated_object_key)
 
-        asyncio.run(
+        _run_async(
             _update_file_after_transcode_async(
                 ctx,
                 curated_object_key=curated_object_key,

@@ -1,7 +1,6 @@
 # app/video_inspect.py
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import tempfile
@@ -13,11 +12,17 @@ from platform_common.db.session import get_session
 from platform_common.models.file import File
 from platform_common.utils.time_helpers import get_current_epoch
 
-from app.services.pubsub_worker import VideoTaskContext  # adjust import
+from app.types.video_task_context import VideoTaskContext
 from app.task.registry.video_task_registry import video_task_handler
 
 logger = get_logger("video.inspect")
 storage_client = storage.Client()  # reuse across calls
+
+
+def _run_async(coro: Any) -> Any:
+    from app.services.pubsub_worker import run_async
+
+    return run_async(coro)
 
 
 def _download_gcs_object_to_tempfile(bucket: str, object_key: str) -> str:
@@ -184,7 +189,7 @@ def handle_video_inspect(ctx: VideoTaskContext) -> bool:
             "video-inspect metadata file_id=%s metadata=%r", ctx.file_id, metadata
         )
 
-        asyncio.run(_save_video_inspect_metadata_async(ctx, metadata))
+        _run_async(_save_video_inspect_metadata_async(ctx, metadata))
         return True
 
     except Exception:
